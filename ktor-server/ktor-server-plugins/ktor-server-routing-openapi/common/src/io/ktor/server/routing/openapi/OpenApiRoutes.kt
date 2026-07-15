@@ -26,7 +26,7 @@ public fun Sequence<Route>.mapToPathItemsAndSchema(): Pair<Map<String, PathItem>
     val pathItems = mapToPathItems(
         PopulateMediaTypeDefaults + CollectSchemaReferences { schema ->
             val title = schema.title ?: return@CollectSchemaReferences null
-            val unqualifiedTitle = title.substringAfterLast('.')
+            val unqualifiedTitle = title.replace(Regex("\\b[a-z]\\w+\\."), "")
             val existingQualifiedTitle = qualifiedNameMap[unqualifiedTitle] ?: title
             // if the shortened title is already in use by a different type, use the full title instead
             val componentName = if (existingQualifiedTitle != title) {
