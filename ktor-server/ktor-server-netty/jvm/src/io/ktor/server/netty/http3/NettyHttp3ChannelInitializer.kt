@@ -10,7 +10,9 @@ import io.netty.channel.ChannelInitializer
 import io.netty.channel.socket.DatagramChannel
 import io.netty.handler.codec.http3.Http3
 import io.netty.handler.codec.http3.Http3ServerConnectionHandler
+import io.netty.handler.codec.quic.QuicChannel
 import io.netty.handler.codec.quic.QuicSslContext
+import io.netty.util.concurrent.EventExecutorGroup
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.CoroutineContext
 
@@ -22,6 +24,7 @@ internal class NettyHttp3ChannelInitializer(
     private val applicationProvider: () -> Application,
     private val enginePipeline: EnginePipeline,
     private val userContext: CoroutineContext,
+    private val callEventGroup: EventExecutorGroup,
     private val runningLimit: Int,
     private val quicSslContext: QuicSslContext,
     private val http3Configuration: NettyHttp3Configuration
@@ -34,6 +37,7 @@ internal class NettyHttp3ChannelInitializer(
             enginePipeline,
             application,
             userContext,
+            callEventGroup,
             runningLimit
         )
 
@@ -46,7 +50,15 @@ internal class NettyHttp3ChannelInitializer(
             .initialMaxStreamDataBidirectionalRemote(http3Configuration.quicInitialMaxStreamDataBidirectionalRemote)
             .initialMaxStreamsBidirectional(http3Configuration.quicInitialMaxStreamsBidirectional)
             .apply(http3Configuration.configureQuicServerCodec)
-            .handler(Http3ServerConnectionHandler(streamInitializer))
+            // Http3ServerConnectionHandler keeps per-connection state and is not @Sharable:
+            // a new instance must be created for every incoming QuicChannel. Passing a single
+            // instance makes every QUIC connection after the first fail pipeline initialization,
+            // so the listener can only ever serve one connection.
+            .handler(object : ChannelInitializer<QuicChannel>() {
+                override fun initChannel(ch: QuicChannel) {
+                    ch.pipeline().addLast(Http3ServerConnectionHandler(streamInitializer))
+                }
+            })
             .build()
 
         ch.pipeline().addLast(quicServerCodec)

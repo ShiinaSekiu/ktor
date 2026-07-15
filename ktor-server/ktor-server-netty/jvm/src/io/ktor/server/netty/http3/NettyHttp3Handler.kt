@@ -6,23 +6,29 @@ package io.ktor.server.netty.http3
 
 import io.ktor.server.application.*
 import io.ktor.server.engine.*
+import io.ktor.server.http.*
 import io.ktor.server.netty.*
 import io.ktor.server.netty.NettyApplicationCallHandler.CallHandlerCoroutineName
 import io.ktor.server.netty.cio.*
 import io.ktor.util.pipeline.*
+import io.ktor.utils.io.*
 import io.netty.channel.ChannelHandlerContext
 import io.netty.handler.codec.http3.Http3DataFrame
+import io.netty.handler.codec.http3.Http3Exception
 import io.netty.handler.codec.http3.Http3Headers
 import io.netty.handler.codec.http3.Http3HeadersFrame
 import io.netty.handler.codec.http3.Http3RequestStreamInboundHandler
 import io.netty.util.AttributeKey
+import io.netty.util.concurrent.EventExecutorGroup
 import kotlinx.coroutines.*
+import java.io.IOException
 import kotlin.coroutines.CoroutineContext
 
 internal class NettyHttp3Handler(
     private val enginePipeline: EnginePipeline,
     private val application: Application,
     private val userCoroutineContext: CoroutineContext,
+    private val callEventGroup: EventExecutorGroup,
     runningLimit: Int
 ) : Http3RequestStreamInboundHandler(), CoroutineScope {
     // Parent [Job] for per-call [Job]s. Cached to avoid re-running `userCoroutineContext[Job]` per request.
@@ -80,8 +86,17 @@ internal class NettyHttp3Handler(
     }
 
     override fun channelInactive(context: ChannelHandlerContext) {
+        onStreamClose(context)
         handlerJob.cancel()
         context.fireChannelInactive()
+    }
+
+    private fun onStreamClose(context: ChannelHandlerContext) {
+        context.applicationCall?.let { call ->
+            context.applicationCall = null
+            @OptIn(InternalAPI::class)
+            call.attributes.getOrNull(HttpRequestCloseHandlerKey)?.invoke()
+        }
     }
 
     override fun channelReadComplete(context: ChannelHandlerContext) {
@@ -92,14 +107,22 @@ internal class NettyHttp3Handler(
 
     @Suppress("OverridingDeprecatedMember")
     override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
-        application.log.error("HTTP/3 stream exception", cause)
+        when (cause) {
+            // Peer-initiated terminations (stream/connection resets, aborted requests) are routine
+            // client behavior and must not produce ERROR-level noise, mirroring HTTP/1 (KTOR-646).
+            is IOException -> application.log.trace("HTTP/3 stream I/O failed", cause)
+            // HTTP/3 protocol violations are peer-triggerable as well.
+            is Http3Exception -> application.log.debug("HTTP/3 protocol error", cause)
+            else -> application.log.error("HTTP/3 stream exception", cause)
+        }
         ctx.close()
     }
 
     private fun startHttp3(context: ChannelHandlerContext, headers: Http3Headers) {
         val callJob = Job(parent = parentJob)
+        val callExecutor = pinnedCallExecutor(context, callEventGroup)
         // Combine the cached static context with the per-stream dispatcher and per-call [Job] only.
-        val callContext = staticCallContext + NettyDispatcher.CurrentContext(context) + callJob
+        val callContext = staticCallContext + NettyDispatcher.CurrentContext(context, callExecutor) + callJob
         val call = NettyHttp3ApplicationCall(
             application,
             context,
@@ -111,7 +134,9 @@ internal class NettyHttp3Handler(
 
         responseWriter.processResponse(call)
 
-        context.executor().execute {
+        // Dispatching to the call event group keeps user handler code off the QUIC event loop,
+        // which drives every connection and stream of this connector (same model as HTTP/1/2).
+        callExecutor.execute {
             val callScope = CoroutineScope(context = callContext)
             callScope.launch(start = CoroutineStart.UNDISPATCHED) {
                 try {
